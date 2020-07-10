@@ -1,0 +1,12 @@
+breast
+endometrium
+large_intestine
+liver
+lung
+oesophagus
+prostate
+skin
+soft_tissue
+stomach
+upper_aerodigestive_tract
+urinary_tract
