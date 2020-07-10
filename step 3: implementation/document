@@ -1,0 +1,31 @@
+** Preprocessing **
+
+download CosmicMutantExport.tsv.gz and put raw_data/CosmicMutatntExport.tsv
+
+from cygwin run sh Preprocessing/make_d1.sh 10
+
+download human genome (GRCh38 Genome Reference) from https://hgdownload.cse.ucsc.edu/goldenpath/hg38/chromosomes/ and put raw_data/
+
+from cygwin run sh Preprocessing/get_M1.sh 400
+
+-----------------------------------------------------------
+** To compile **
+
+add -I "D:\Applications\boost\boost_1_58_0" to makefile
+
+from cygwin run make
+
+-----------------------------------------------------------
+** To extract mutation signatures **
+
+from cygwin run scripts/MS_real.sh 1 400 
+
+-----------------------------------------------------------
+** To draw VLB for each number of mutation signatures (find best number of mutation signatures)  **
+
+sh scripts/make_figure.sh 1 400 
+
+-----------------------------------------------------------
+** To generate mutations from known mutationa signature **
+
+python mutations_generator.py 0.1 0.01 4 100 2000
