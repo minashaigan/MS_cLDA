@@ -15,4 +15,4 @@
   - [27:AA] **Mutation strand** - postive or negative.
 
 
-![alt text](https://github.com/minashaigan/MS_cLDA/blob/master/data.png)
+![alt text](https://github.com/minashaigan/MS_cLDA/blob/master/step2:%20data%20collection/data.png)
