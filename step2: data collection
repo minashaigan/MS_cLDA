@@ -13,3 +13,6 @@ file format:
   [22:V] Mutation Description - Type of mutation at the amino acid level (substitution, deletion, insertion, complex, fusion, unknown etc.)
   [26:Z] Mutation genome position - The genomic coordinates of the mutation.
   [27:AA] Mutation strand - postive or negative.
+
+
+https://github.com/minashaigan/MS_cLDA/blob/master/Picture1.png
