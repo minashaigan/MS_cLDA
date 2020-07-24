@@ -15,4 +15,4 @@ file format:
   [27:AA] Mutation strand - postive or negative.
 
 
-https://github.com/minashaigan/MS_cLDA/blob/master/Picture1.png
+![alt text](https://github.com/minashaigan/MS_cLDA/blob/master/Picture1.png)
