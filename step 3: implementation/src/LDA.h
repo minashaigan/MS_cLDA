@@ -23,9 +23,18 @@ class LDA {
         vector<vector<vector<vector<double> > > > phi;
 		vector<vector<vector<double> > > rho; 
         vector<vector<double> > lam; vector<vector<double> > tau;
-        vector<double> alpha; vector<double> beta; vector<double> eta;
-        double temp_vlb;
-        double old_vlb;
+        vector<double> alpha; vector<double> beta; vector<double> eta;	
+		vector<vector<double> > w_tau;
+		vector<double> a_tau;
+		double em_conv_ratio;
+		double em_lb_old;
+		double em_lb_current;
+		double doc_vi_cr;
+		double doc_vi_lb;
+		double doc_vi_lb_old;
+		double vi_tau_cr;
+		double vi_lb_tau;
+		double vi_lb_tau_old;	
     public:
         LDA(int x, int y, int z, int v);
         void run_VB();
@@ -36,10 +45,12 @@ class LDA {
         void Update_lam();
 		void Update_tau();
         void Update_hyperparameter();
-        void calc_vlb();
+        void calc_em_lb();
+        void calc_doc_vi_lb();
+        void calc_vi_lb_tau();
         void load_data();
         void write_data();
-        void show_vlb();
+        void show_em_lb();
         void Normalize(vector<double> &vec, int &length);
 };
 
@@ -50,27 +61,49 @@ LDA::LDA(int x, int y, int z, int v){
 
 void LDA::run_VB(){
     initialize();
-    old_vlb = -10e15;
-    for (int i=0; i < 20; i++){		
-        cout << "iter : " << i << endl;
+	em_conv_ratio = 1.0;
+	em_lb_old = 0;
+	int opt_iter = 0;
+	int i, it;
+    for (i=0; i < 100; i++){	
+		opt_iter++;
+
 		// Step 1: Expectation
 		initialize_rho();
-		for (int it=0; it < 3; it++){	
+		
+		doc_vi_cr = 1.0;
+		doc_vi_lb_old = 0;
+		int vi_iter = 0;
+		for (it=0; it < 50; it++){
+			vi_iter++;
+	
 			Update_phi(); 	// Variational updates for each document
 			Update_rho();
+			
+			calc_doc_vi_lb();
+			if(doc_vi_cr < 1e-6){
+				break;
+			}
+			if(vi_iter>1)
+				doc_vi_cr = (doc_vi_lb_old - doc_vi_lb) / doc_vi_lb_old;
+			doc_vi_lb_old = doc_vi_lb;
 		}
         Update_lam();   // Variational updates for each topic
+		
 		// Step 2: Maximization
 		Update_tau();	// Constraint Newton updates for collection-level topic mixtures
         Update_hyperparameter();
-        calc_vlb();
-        show_vlb();
-        if(fabs(temp_vlb - old_vlb) < 1){
+        calc_em_lb();
+        show_em_lb();
+        if((em_conv_ratio > 0) && (em_conv_ratio < 1e-4)){
             break;
         }
-        old_vlb = temp_vlb;
+		if(opt_iter>1)
+			em_conv_ratio = (em_lb_old - em_lb_current) / em_lb_old;
+        em_lb_old = em_lb_current;
         cout << endl;
     }
+	cout<<"last iteration : "<<i<<endl;
 }
 
 void LDA::initialize(){
@@ -116,20 +149,32 @@ void LDA::initialize(){
 	for (k=0; k < num_topic; k++){
         lam[k].resize(num_vocab, 0);
 		for (v=0; v < num_vocab; v++){
-			lam[k][v] = (double) rnd();
+			lam[k][v] = beta[v] + 1/num_vocab;
 		}
-		Normalize(lam[k], num_vocab);
     }
+	
+	int N_j = 0;
+	for(j=0; j < num_lesion; j++){
+		for (d=0; d < documents[j].size(); d++){
+			N_j += documents[j][d].size();
+		}
+	}
+	
+	w_tau.resize(num_lesion);
+	a_tau.resize(num_lesion, 0);
+	for(j=0; j < num_lesion; j++){
+		w_tau[j].resize(num_topic, 0);
+	}
 	
 	tau.resize(num_lesion);
 	for (j=0; j < num_lesion; j++){
         tau[j].resize(num_topic, 0);
 		for (k=0; k < num_topic; k++){
-			tau[j][k] = (double) rnd();
+			tau[j][k] = alpha[k] + N_j/num_topic;
 		}
 		Normalize(tau[j], num_topic);
     }
-	
+
 }
 
 void LDA::initialize_rho(){
@@ -149,13 +194,6 @@ void LDA::initialize_rho(){
 			}
 		}
 	}
-	// normalize
-	for(j=0; j < num_lesion; j++){
-		for (d=0; d < documents[j].size(); d++){
-			Normalize(rho[j][d], num_topic);
-		}
-	}
-
 }
 
 void LDA::Update_phi(){
@@ -177,7 +215,6 @@ void LDA::Update_phi(){
 	}
 		
 	// Variational Multinomial updates for each document
-	// cout<<"digamma: 1"<<endl;
 	for(j=0; j < num_lesion; j++){
 		for(d=0; d < documents[j].size(); d++){
 			for(i=0; i < documents[j][d].size(); i++){
@@ -186,6 +223,8 @@ void LDA::Update_phi(){
 										+ boost::math::digamma(lam[k][documents[j][d][i]])
 										- boost::math::digamma(sum_rho[j][d]) 
 										- boost::math::digamma(sum_lam[k]));
+					if(phi[j][d][i][k]<1e-15)
+						phi[j][d][i][k] = 1e-15;
 				}
 			}
 		}
@@ -198,8 +237,7 @@ void LDA::Update_phi(){
 				Normalize(phi[j][d][i], num_topic);
 			}
 		}
-	}
-	
+	}	
 }
 
 void LDA::Update_rho(){
@@ -237,22 +275,6 @@ void LDA::Update_rho(){
 		}
 	}
 	
-	
-	// for(j=0; j < num_lesion; j++){
-		// for(d=0; d < documents[j].size(); d++){
-			// for(k=0; k < num_topic; k++){
-				// if(rho[j][d][k]<0 || rho[j][d][k]>1)
-					// cout<<rho[j][d][k]<<endl; 
-			// }
-		// }
-	// }
-	
-	// normalize
-	// for(j=0; j < num_lesion; j++){
-		// for(d=0; d < documents[j].size(); d++){
-			// Normalize(rho[j][d], num_topic);
-		// }
-	// }
 }
 
 void LDA::Update_lam(){
@@ -277,45 +299,21 @@ void LDA::Update_lam(){
             lam[k][v] = beta[v] + temp_phi[k][v];
         }
 	}
-	
-	// normalize
-	// for (k=0; k < num_topic; k++){
-		// Normalize(lam[k], num_vocab);
-    // }
 }
 
 void LDA::Update_tau(){
 	int j, k, d;
-	random_device rnd;
-	mt19937 mt(rnd());
-    uniform_real_distribution<double> Uniform(0.0, 1.0);
-	
-	vector<vector<double> > w_tau;
-    vector<double> a_tau;
 	
 	vector<vector<double> > g_w_tau;
     vector<vector<double> > h_w_tau;
     vector<double> g_a_tau;
 	vector<double> h_a_tau;
 	
-	vector<vector<double> > sum_rho;
-    sum_rho.resize(num_lesion);
-    for(j=0; j < num_lesion; j++){
-		sum_rho[j].resize(num_topic, 0);
-		for(k=0; k < num_topic; k++){
-			for(d=0; d < documents[j].size(); d++){
-				sum_rho[j][k] += boost::math::digamma(rho[j][d][k]);
-			}
-		}
-    }
-	
 	vector<double> new_numerator_w_tau;
 	new_numerator_w_tau.resize(num_lesion, 0);
 	vector<double> new_denominator_w_tau;
 	new_denominator_w_tau.resize(num_lesion, 0);
 	
-	w_tau.resize(num_lesion);
-	a_tau.resize(num_lesion, 0);
 	g_w_tau.resize(num_lesion);
 	h_w_tau.resize(num_lesion);
 	g_a_tau.resize(num_lesion, 0);
@@ -325,16 +323,25 @@ void LDA::Update_tau(){
 		h_w_tau[j].resize(num_topic, 0);
 	}
 	
-	// initialize a, w based on tau
-	for(j=0; j < num_lesion; j++){
-		a_tau[j] = Uniform(mt);
-		
-		w_tau[j].resize(num_topic, 0);
-		for (k=0; k < num_topic; k++){
-			w_tau[j][k] = (double) rnd();//Uniform(mt);
+	vector<vector<double> > sum_rho_k;
+    sum_rho_k.resize(num_lesion);
+    for(j=0; j < num_lesion; j++){
+		sum_rho_k[j].resize(documents[j].size(), 0);
+		for(d=0; d < documents[j].size(); d++){
+			sum_rho_k[j][d] = accumulate(rho[j][d].begin(), rho[j][d].end(), 0.0);
 		}
-		Normalize(w_tau[j], num_topic);
-	}
+    }
+	
+	vector<vector<double> > sum_rho;
+    sum_rho.resize(num_lesion);
+    for(j=0; j < num_lesion; j++){
+		sum_rho[j].resize(num_topic, 0);
+		for(k=0; k < num_topic; k++){
+			for(d=0; d < documents[j].size(); d++){
+				sum_rho[j][k] += boost::math::digamma(rho[j][d][k]) - boost::math::digamma(sum_rho_k[j][d]);
+			}
+		}
+    }
 	
 	vector<int> D_size;
 	D_size.resize(num_lesion, 0);
@@ -342,76 +349,42 @@ void LDA::Update_tau(){
 		D_size[j] = documents[j].size();
 	}
 	
+	vector<double> sum_tau;
+	sum_tau.resize(num_lesion, 0);
+	for(j=0; j < num_lesion; j++){
+		sum_tau[j] = accumulate(tau[j].begin(), tau[j].end(), 0.0);
+	}
+	
+	for(j=0; j < num_lesion; j++){
+		a_tau[j] = sum_tau[j];
+		for (k=0; k < num_topic; k++){
+			w_tau[j][k] = tau[j][k]/sum_tau[j];
+		}
+	}
+	
+	vi_tau_cr = 1.;
+	vi_lb_tau_old = 0;
+	int opt_iter = 0;
 	// while not converged do
-	for (int it=0; it < 5; it++){
-		////cout<<"tau it :"<<it<<endl;
-		// for(j=0; j < num_lesion; j++){
-			// for (k=0; k < num_topic; k++){
-				// if(isnan(boost::math::trigamma(a_tau[j]*w_tau[j][k])))
-					// cout<<"trigamma a_tau[j]*w_tau[j][k] : "<<a_tau[j]*w_tau[j][k]<<endl;
-				// if(isnan(boost::math::digamma(a_tau[j]*w_tau[j][k])))
-					// cout<<"digamma a_tau[j]*w_tau[j][k] : "<<a_tau[j]*w_tau[j][k]<<endl;
-				// if(isnan(boost::math::digamma(eta[k]*w_tau[j][k]))){
-					// cout<<"digamma eta[k]: "<<eta[k]<<endl;
-					// cout<<"digamma w_tau[j][k] : "<<w_tau[j][k]<<endl;
-				// }
-				// if(isnan(log(a_tau[j]*w_tau[j][k]))){
-					// cout<<"log(a_tau[j]) : "<<a_tau[j]<<endl;
-					// cout<<"log(w_tau[j][k]) : "<<w_tau[j][k]<<endl;
-				// }
-				// if(isnan(g_w_tau[j][k]))
-					// cout<<"g_w_tau["<<j<<"]["<<k<<"]: "<< g_w_tau[j][k]<< endl;
-				// if(isnan(h_w_tau[j][k]))
-					// cout<<"h_w_tau["<<j<<"]["<<k<<"]: "<< h_w_tau[j][k]<< endl;
-			// }
-		// }
+	int it;
+	for (it=0; it < 20; it++){
+		opt_iter++;
 		
-		// cout << "digamma: 3" << endl;
-		for(j=0; j < num_lesion; j++){	
-			// cout<< "a_tau["<< j << "]: "<< a_tau[j]<<endl;
-			// Constraint Newton update for w_tau
+		// Constraint Newton update for w_tau
+		for(j=0; j < num_lesion; j++){		
 			for (k=0; k < num_topic; k++){
-				// cout<<"sum_rho[j][k]: "<<sum_rho[j][k]<<endl;
-				// cout<<"w_tau["<<j<<"]["<<k<<"]: "<< w_tau[j][k]<< endl;
-				// cout<<"a_tau[j]*w_tau[j][k] : "<<a_tau[j]*w_tau[j][k]<<endl;
-				// if(a_tau[j]*w_tau[j][k]>0){
-				g_w_tau[j][k] = a_tau[j] * boost::math::trigamma(a_tau[j]*w_tau[j][k]) * ( alpha[k] + D_size[j]	- a_tau[j]*w_tau[j][k] - eta[k]*D_size[j]*w_tau[j][k]  ) - eta[k]*D_size[j]*boost::math::digamma(a_tau[j]*w_tau[j][k]) + eta[k]*sum_rho[j][k] - D_size[j]*( eta[k]*boost::math::digamma(eta[k]*w_tau[j][k]) + 1/w_tau[j][k]-eta[k]-eta[k]*log(a_tau[j]*w_tau[j][k]) );				
-				// }
-				// else{
-					// g_w_tau[j][k] = a_tau[j] * boost::math::trigamma(a_tau[j]*w_tau[j][k]) * ( alpha[k] + D_size[j]	- a_tau[j]*w_tau[j][k] - eta[k]*D_size[j]*w_tau[j][k]  ) - eta[k]*D_size[j]*boost::math::digamma(a_tau[j]*w_tau[j][k]) + eta[k]*sum_rho[j][k] - D_size[j]*( eta[k]*boost::math::digamma(eta[k]*w_tau[j][k]) + 1/w_tau[j][k]-eta[k]-eta[k]*-1 );				
-					// if(eta[k]*w_tau[j][k]>0.5)
-						// g_w_tau[j][k] = a_tau[j] * -10 * ( alpha[k] + D_size[j]	- a_tau[j]*w_tau[j][k] - eta[k]*D_size[j]*w_tau[j][k]  ) - eta[k]*D_size[j]*-10 + eta[k]*sum_rho[j][k] - D_size[j]*( eta[k]*boost::math::digamma(eta[k]*w_tau[j][k]) + 1/w_tau[j][k]-eta[k]-eta[k]*log(a_tau[j]*w_tau[j][k]) );				
-					// else
-						// g_w_tau[j][k] = a_tau[j] * -10 * ( alpha[k] + D_size[j]	- a_tau[j]*w_tau[j][k] - eta[k]*D_size[j]*w_tau[j][k]  ) - eta[k]*D_size[j]*-10 + eta[k]*sum_rho[j][k] - D_size[j]*( eta[k]*-10 + 1/w_tau[j][k]-eta[k]-eta[k]*log(a_tau[j]*w_tau[j][k]) );				
-				// }
+				g_w_tau[j][k] = a_tau[j] * boost::math::trigamma(a_tau[j]*w_tau[j][k]) * ( alpha[k] + D_size[j]	- a_tau[j]*w_tau[j][k] - eta[k]*D_size[j]*w_tau[j][k]  ) - eta[k]*D_size[j]*boost::math::digamma(a_tau[j]*w_tau[j][k]) + eta[k]*sum_rho[j][k] + eta[k]*D_size[j]*(boost::math::digamma(a_tau[j]) - log(a_tau[j])) - D_size[j]*(-eta[k]/a_tau[j]+ eta[k]*boost::math::digamma(eta[k]*w_tau[j][k]) + 1/w_tau[j][k]-eta[k]-eta[k]*log(a_tau[j]*w_tau[j][k]) );				
 				h_w_tau[j][k] = a_tau[j] * a_tau[j] * boost::math::polygamma(2,a_tau[j]*w_tau[j][k]) * ( alpha[k] + D_size[j] - a_tau[j]*w_tau[j][k] - eta[k]*D_size[j]*w_tau[j][k]  ) - a_tau[j]*boost::math::trigamma(a_tau[j]*w_tau[j][k]) * ( a_tau[j] + 2*eta[k]*D_size[j] ) - D_size[j] * ( eta[k] * eta[k] * boost::math::trigamma(eta[k]*w_tau[j][k]) - ( 1 / (w_tau[j][k]*w_tau[j][k]) ) - eta[k]/w_tau[j][k]  );
 			}
 		}
 		
-		// for(j=0; j < num_lesion; j++){
-			// for (k=0; k < num_topic; k++){
-				// if(isnan(a_tau[j] * boost::math::trigamma(a_tau[j]*w_tau[j][k]) * ( alpha[k] + D_size[j]	- a_tau[j]*w_tau[j][k] - eta[k]*D_size[j]*w_tau[j][k]  )))
-					// cout<<"first"<<endl;
-				// if(isnan(- eta[k]*D_size[j]*boost::math::digamma(a_tau[j]*w_tau[j][k]) + eta[k]*sum_rho[j][k]))
-					// cout<<"second"<<endl;
-				// if(isnan(- D_size[j]*( eta[k]*boost::math::digamma(eta[k]*w_tau[j][k]) + 1/w_tau[j][k]-eta[k]-eta[k]*log(a_tau[j]*w_tau[j][k]) )))
-					// cout<<"third"<<endl;
-				// if(isnan(g_w_tau[j][k]))
-					// cout<<"g_w_tau["<<j<<"]["<<k<<"]: "<< g_w_tau[j][k]<< endl;
-				// if(isnan(h_w_tau[j][k]))
-					// cout<<"h_w_tau["<<j<<"]["<<k<<"]: "<< h_w_tau[j][k]<< endl;
-				// if(h_w_tau[j][k]==0)
-					// cout<<"000"<<endl;
-			// }
-		// }
-		
+		//Constraint Newton update for a_tau
 		for(j=0; j < num_lesion; j++){	
-			// Constraint Newton update for a_tau
 			g_a_tau[j] = 0;
 			h_a_tau[j] = 0;
 			for (k=0; k < num_topic; k++){
-				g_a_tau[j] += ( w_tau[j][k]*boost::math::trigamma(a_tau[j]*w_tau[j][k])-boost::math::trigamma(a_tau[j])) * ( alpha[k] + D_size[j] - a_tau[j]*w_tau[j][k] - eta[k]*D_size[j]*w_tau[j][k]) + (num_topic - 1)*eta[k]*D_size[j]* ( 1/ (a_tau[j]*a_tau[j]) );
-				h_a_tau[j] += ( w_tau[j][k]*w_tau[j][k]*boost::math::polygamma(2,a_tau[j]*w_tau[j][k])-boost::math::polygamma(2, a_tau[j]) ) * ( alpha[k] + D_size[j] - a_tau[j]*w_tau[j][k] - eta[k]*D_size[j]*w_tau[j][k]) - w_tau[j][k]*(w_tau[j][k]*boost::math::trigamma(a_tau[j]*w_tau[j][k])-boost::math::trigamma(a_tau[j])) - 2*(num_topic-1)*eta[k]*D_size[j]* ( 1/ (a_tau[j]*a_tau[j]*a_tau[j]) );
+				g_a_tau[j] += ( w_tau[j][k]*boost::math::trigamma(a_tau[j]*w_tau[j][k])-boost::math::trigamma(a_tau[j])) * ( alpha[k] + D_size[j] - a_tau[j]*w_tau[j][k] - eta[k]*D_size[j]*w_tau[j][k]) + (1-w_tau[j][k])*eta[k]*D_size[j]* ( 1/ (a_tau[j]*a_tau[j]) );
+				h_a_tau[j] += ( w_tau[j][k]*w_tau[j][k]*boost::math::polygamma(2,a_tau[j]*w_tau[j][k])-boost::math::polygamma(2, a_tau[j]) ) * ( alpha[k] + D_size[j] - a_tau[j]*w_tau[j][k] - eta[k]*D_size[j]*w_tau[j][k]) - w_tau[j][k]*(w_tau[j][k]*boost::math::trigamma(a_tau[j]*w_tau[j][k])-boost::math::trigamma(a_tau[j])) - 2*(1-w_tau[j][k])*eta[k]*D_size[j]* ( 1/ (a_tau[j]*a_tau[j]*a_tau[j]) );
 			}
 		}
 		
@@ -423,57 +396,34 @@ void LDA::Update_tau(){
 				new_denominator_w_tau[j] += 1/h_w_tau[j][k];
 			}
 		}
-		
-		
+
 		for(j=0; j < num_lesion; j++){
-			// sum on k for w_tau = 1
 			int flag = 0;
 			for (k=0; k < num_topic; k++){
-				// w_tau[j][k] += new_numerator_w_tau[j]/new_denominator_w_tau[j] * ( left[j][k]/ right[j][k]);
 				w_tau[j][k] += new_numerator_w_tau[j]/new_denominator_w_tau[j] * (1/ h_w_tau[j][k]) - (g_w_tau[j][k]/ h_w_tau[j][k]);
-				
 				if(w_tau[j][k]<0 || w_tau[j][k]>1){
-					flag = 1;
-					// cout<<"w_tau["<<j<<"]["<<k<<"]: "<<w_tau[j][k]<<endl;
-					// w_tau[j][k] = (w_tau[j][k] + double(2)) / double(4) ;
-					// cout<<"w_tau[j][k]: "<<w_tau[j][k]<<endl;					
+					flag = 1;		
 				}
 			}
 			if(flag==1){
 				for (k=0; k < num_topic; k++){
-					// cout<<"w_tau["<<j<<"]["<<k<<"]: "<<w_tau[j][k]<<endl;
-					w_tau[j][k] = (w_tau[j][k] + double(2)) / (double(num_topic*2)) ;
-					// cout<<"w_tau["<<j<<"]["<<k<<"]: "<<w_tau[j][k]<<endl;
+					w_tau[j][k] = (w_tau[j][k] + double(2)) / (double(num_lesion*num_topic*2)) ;
 				}	
 			}
 		}
-		
-		double sum = 0;
-		for(j=0; j < num_lesion; j++){
-			//sum on k for w_tau = 1
-			for (k=0; k < num_topic; k++){
-				sum += w_tau[j][k];
-			}
-		}
-		
-		cout<<"sum : "<<sum<<endl;
-
-		// normalize
-		// for(j=0; j < num_lesion; j++){
-			// Normalize(w_tau[j], num_topic);
-		// }
-		
-		// for(j=0; j < num_lesion; j++){
-			// for (k=0; k < num_topic; k++){
-				// if(w_tau[j][k]<0 || w_tau[j][k]>1 || isnan(w_tau[j][k]))
-					// cout<<"w_tau["<<j<<"]["<<k<<"]: "<< w_tau[j][k]<< endl;
-			// }
-		// }
 			
 		for(j=0; j < num_lesion; j++){
-			a_tau[j] += -g_a_tau[j] / h_a_tau[j];
+			if(a_tau[j] -g_a_tau[j] / h_a_tau[j] > 0)
+				a_tau[j] += -g_a_tau[j] / h_a_tau[j];
 		}
 
+		calc_vi_lb_tau();
+		if(fabs(vi_tau_cr) < 1e-10){
+			break;
+		}
+		if (opt_iter > 5)
+			vi_tau_cr = (vi_lb_tau_old - vi_lb_tau) / vi_lb_tau_old;
+		vi_lb_tau_old = vi_lb_tau;
 	}
 	
 	for(j=0; j < num_lesion; j++){
@@ -481,51 +431,14 @@ void LDA::Update_tau(){
 			tau[j][k] = a_tau[j] * w_tau[j][k];
 		}
 	}
-	
-	// normalize
-	for(j=0; j < num_lesion; j++){
-		Normalize(tau[j], num_topic);
-	}
-	
-	// for(j=0; j < num_lesion; j++){
-		// for (k=0; k < num_topic; k++){
-			// if(tau[j][k]<0){
-				// cout<<"tau["<<j<<"]["<<k<<"]: "<< tau[j][k]<< endl;
-				// cout<<" a_tau[j] : "<<a_tau[j]<<endl;
-				// cout<<" w_tau[j][k] : "<<w_tau[j][k]<<endl;
-			// }
-		// }
-	// }
-	
-	// for (k=0; k < num_topic; k++){
-		// cout<<"eta["<<k<<"]: "<<eta[k]<<endl;
-	// }
-	
 }
 
 void LDA::Update_hyperparameter(){
-	// cout << "Update_hyperparameter" << endl;
     int j,d,v,i,k;
-    
-	// vector<double> g_alpha;
-	// vector<double> h_alpha;
-	// g_alpha.resize(num_topic, 0);
-	// h_alpha.resize(num_topic, 0);
 	
-	// vector<double> g_beta;
-	// vector<double> h_beta;
-	// g_beta.resize(num_vocab, 0);
-	// h_beta.resize(num_vocab, 0);
-	
-	vector<double> g_eta;
-	vector<double> h_eta;
-	g_eta.resize(num_topic, 0);
-	h_eta.resize(num_topic, 0);
-	
-	double sum = 0;
-	
-	// update hyperparameter alpha
-	// double sum_alpha = accumulate(alpha.begin(), alpha.end(), 0.0);
+	double sum_alpha = accumulate(alpha.begin(), alpha.end(), 0.0);
+	double sum_beta = accumulate(beta.begin(), beta.end(), 0.0);
+	double sum_eta = accumulate(eta.begin(), eta.end(), 0.0);
 	
 	vector<double> sum_tau;
 	sum_tau.resize(num_lesion, 0);
@@ -533,145 +446,11 @@ void LDA::Update_hyperparameter(){
 		sum_tau[j] = accumulate(tau[j].begin(), tau[j].end(), 0.0);
 	}
 	
-	// for(j=0; j < num_lesion; j++){
-		// for (k=0; k < num_topic; k++){
-			// sum += boost::math::digamma(tau[j][k]) - boost::math::digamma(sum_tau[j]);
-		// }
-	// }
-	// cout<< "problem 1"<<endl;
-	// for (k=0; k < num_topic; k++){
-		// g_alpha[k] = num_lesion * (boost::math::digamma(sum_alpha) - boost::math::digamma(alpha[k]) ) + sum;
-		// h_alpha[k] = num_lesion * boost::math::trigamma(sum_alpha) - num_lesion*boost::math::trigamma(alpha[k]);
-	// }
-
-	// int count = 0;
-    // for (k=0; k < num_topic; k++){
-        // if (g_alpha[k] == 0){
-            // count ++;
-        // }
-    // }
-    // if (count == 0){
-        // for (k=0; k < num_topic; k++){
-            // alpha[k] += - g_alpha[k]/h_alpha[k];
-        // }
-    // }
-	
-	vector<double> new_numerator_alpha;
-    vector<double> new_denominator_alpha;
-    new_numerator_alpha.resize(num_topic, 0);
-    new_denominator_alpha.resize(num_topic, 0);
-
-	// cout << "digamma: 4" << endl;
-    for (k=0; k < num_topic; k++){
-		// cout<<"alpha[k] : "<<alpha[k]<<endl;
-		for(j=0; j < num_lesion; j++){
-			// cout<<"tau[j][k] : "<<tau[j][k]<<endl;
-            new_numerator_alpha[k]
-                += (boost::math::digamma(tau[j][k] + alpha[k])
-                    - boost::math::digamma(alpha[k]) ) * alpha[k];
-        }
-    }
-	
-	vector<double> sum_qz_dika;
-    double sum_alpha = accumulate(alpha.begin(), alpha.end(), 0.0);
-    sum_qz_dika.resize(num_lesion, 0);
-    for(j=0; j < num_lesion; j++){
-        for (k=0; k < num_topic; k++){
-            sum_qz_dika[j] += tau[j][k] + alpha[k];
-			// sum_qz_dika[j] += tau[j][k];
-        }
-    }
-	
-	// cout << "digamma: 5" << endl;
-    for (k=0; k < num_topic; k++){
-		for(j=0; j < num_lesion; j++){
-            new_denominator_alpha[k]
-                += boost::math::digamma(sum_qz_dika[j])
-                - boost::math::digamma(sum_alpha);
-			// new_denominator_alpha[k]
-                // += boost::math::digamma(sum_qz_dika[j]+sum_alpha)
-                // - boost::math::digamma(sum_alpha);
-        }
-    }
-	
-    for (k=0; k < num_topic; k++){
-        alpha[k] = new_numerator_alpha[k]/new_denominator_alpha[k];
-    }
-	
-	// update hyperparameter beta
-	// double sum_beta = accumulate(beta.begin(), beta.end(), 0.0);
-	
-	// vector<double> sum_lam;
-	// sum_lam.resize(num_topic, 0);
-	// for(k=0; k < num_topic; k++){
-		// sum_lam[k] = accumulate(lam[k].begin(), lam[k].end(), 0.0);
-	// } 
-	
-	// sum = 0;
-	// cout<< "problem 2"<<endl;
-	// for(k=0; k < num_topic; k++){
-		// for (v=0; v < num_vocab; v++){
-			// sum += boost::math::digamma(lam[k][v]) - boost::math::digamma(sum_lam[k]);
-		// }
-	// }
-	
-	// cout<< "problem 3: "<< sum_beta <<endl;
-	// for (v=0; v < num_vocab; v++){
-		// g_beta[v] = num_topic * (boost::math::digamma(sum_beta) - boost::math::digamma(beta[v]) ) + sum;
-		// h_beta[v] = num_topic * boost::math::trigamma(sum_beta) - num_topic*boost::math::trigamma(beta[v]);
-	// }	
-
-	// for (v=0; v < num_vocab; v++){	
-		// beta[v] += -g_beta[v]/h_beta[v];
-	// }
-	
-	vector<double> new_numerator_beta;
-    vector<double> new_denominator_beta;
-    new_numerator_beta.resize(num_vocab, 0);
-    new_denominator_beta.resize(num_vocab, 0);
-
-
-	// cout << "digamma: 6" << endl;
-    for (v=0; v < num_vocab; v++){
-        for (k=0; k < num_topic; k++){
-            new_numerator_beta[v]
-                += (boost::math::digamma(lam[k][v] + beta[v])
-                    - boost::math::digamma(beta[v])) * beta[v];
-        }
-    }
-	// cout<< "end"<<endl;
-    vector<double> sum_qz_jdiv;
-    double sum_beta = accumulate(beta.begin(), beta.end(), 0.0);
-    sum_qz_jdiv.resize(num_topic, 0);
-    for (k=0; k < num_topic; k++){
-        for (v=0; v < num_vocab; v++){
-            sum_qz_jdiv[k] += lam[k][v] + beta[v];
-			// sum_qz_jdiv[k] += lam[k][v];
-        }
-    }
-
-	// cout << "digamma: 7" << endl;
-    for (v=0; v < num_vocab; v++){
-        for (k=0; k < num_topic; k++){
-            // new_denominator_beta[v]
-                // += boost::math::digamma(sum_qz_jdiv[k] + sum_beta)
-                // - boost::math::digamma(sum_beta);
-			new_denominator_beta[v]
-                += boost::math::digamma(sum_qz_jdiv[k])
-                - boost::math::digamma(sum_beta);
-        }
-    }
-    for (v=0; v < num_vocab; v++){
-        beta[v] = new_numerator_beta[v] /new_denominator_beta[v];
-    }
-	
-	// update hyperparameter eta
-	
-	vector<double> new_numerator_eta;
-    vector<double> new_denominator_eta;
-    new_numerator_eta.resize(num_topic, 0);
-    new_denominator_eta.resize(num_topic, 0);
-	double sum_eta = accumulate(eta.begin(), eta.end(), 0.0);
+	vector<double> sum_lam;
+	sum_lam.resize(num_topic, 0);
+	for(k=0; k < num_topic; k++){
+		sum_lam[k] = accumulate(lam[k].begin(), lam[k].end(), 0.0);
+	}
 	
 	vector<vector<double> > sum_rho;
     sum_rho.resize(num_lesion);
@@ -682,140 +461,129 @@ void LDA::Update_hyperparameter(){
 		}
     }
 	
-	// cout << "digamma: 8" << endl;
+	// update hyperparameter alpha
+	
+	vector<double> g_alpha;
+	vector<double> h_alpha;
+	g_alpha.resize(num_topic, 0);
+	h_alpha.resize(num_topic, 0);
+	
 	
 	for (k=0; k < num_topic; k++){
-        for (j=0; j < num_lesion; j++){
-			for(d=0; d < documents[j].size(); d++){
-				new_numerator_eta[k]
-					+= (log(tau[j][k]) + boost::math::digamma( rho[j][d][k] + eta[k] * tau[j][k] / sum_tau[j]) - boost::math::digamma( tau[j][k] + eta[k] * tau[j][k] / sum_tau[j])
-					  - boost::math::digamma( eta[k] * tau[j][k] / sum_tau[j] )) * eta[k]*(tau[j][k] / sum_tau[j]);
-			}
+		g_alpha[k] = num_lesion * (boost::math::digamma(sum_alpha) - boost::math::digamma(alpha[k]));
+		for(j=0; j < num_lesion; j++){
+			g_alpha[k] += boost::math::digamma(tau[j][k]) - boost::math::digamma(sum_tau[j]);
         }
     }
 	
-	vector<vector<double> > sum_qz_ika;
-    sum_qz_ika.resize(num_lesion);
-    for(j=0; j < num_lesion; j++){
-		sum_qz_ika[j].resize(documents[j].size(), 0);
-		for(d=0; d < documents[j].size(); d++){
-			for (k=0; k < num_topic; k++){
-				sum_qz_ika[j][d] += rho[j][d][k] + eta[k];
-			}
-		}
+	double z_alpha = num_lesion * boost::math::trigamma(sum_alpha);
+	vector<double> q_alpha;
+	q_alpha.resize(num_topic, 0);
+	
+	for (k=0; k < num_topic; k++){
+		q_alpha[k] = -num_lesion * boost::math::trigamma(alpha[k]);
     }
 	
-	vector<double> sum_qz_ia;
-    sum_qz_ia.resize(num_lesion, 0);
-    for(j=0; j < num_lesion; j++){
-		for (k=0; k < num_topic; k++){
-			sum_qz_ia[j] += tau[j][k] + eta[k];
-		}
-    }
+	double b_alpha;
+	double left = 0,right = 0;
+	for (k=0; k < num_topic; k++){
+		left += g_alpha[k] / q_alpha[k];
+		right += 1 / q_alpha[k];
+	}
+	b_alpha = left / (1/z_alpha + right);
     
-    for (k=0; k < num_topic; k++){
-        for (j=0; j < num_lesion; j++){
-			for(d=0; d < documents[j].size(); d++){
-				new_denominator_eta[k]
-					+= log(sum_tau[j]) + boost::math::digamma(sum_qz_ika[j][d]) -  boost::math::digamma( sum_qz_ia[j])
-					- boost::math::digamma(sum_eta);
-			}
+
+	for (k=0; k < num_topic; k++){
+		if(alpha[k] + (-g_alpha[k]+b_alpha) / q_alpha[k] > 0)
+			alpha[k] += (-g_alpha[k]+b_alpha) / q_alpha[k];
+	}
+	
+	// update hyperparameter beta
+	
+	vector<double> g_beta;
+	vector<double> h_beta;
+	g_beta.resize(num_vocab, 0);
+	h_beta.resize(num_vocab, 0);
+	
+	for (v=0; v < num_vocab; v++){
+		g_beta[v] = num_topic * (boost::math::digamma(sum_beta) - boost::math::digamma(beta[v]));
+		for (k=0; k < num_topic; k++){
+			g_beta[v] += boost::math::digamma(lam[k][v]) - boost::math::digamma(sum_lam[k]);
         }
     }
-    for (k=0; k < num_topic; k++){
-        eta[k] = new_numerator_eta[k] / new_denominator_eta[k];
+	
+	double z_beta = num_topic * boost::math::trigamma(sum_beta);
+	vector<double> q_beta;
+	q_beta.resize(num_vocab, 0);
+	
+	for (v=0; v < num_vocab; v++){
+		q_beta[v] = -num_topic *  boost::math::trigamma(beta[v]);
     }
 	
+	double b_beta;
+	left = 0;right = 0;
+	for (v=0; v < num_vocab; v++){
+		left += g_beta[v] / q_beta[v];
+		right += 1 / q_beta[v];
+	}
+	b_beta = left / (1/z_beta + right);
+    
+
+	for (v=0; v < num_vocab; v++){
+		if(beta[v] + (-g_beta[v]+b_beta) / q_beta[v] > 0)
+			beta[v] += (-g_beta[v]+b_beta) / q_beta[v];
+	}
+	
+	// update hyperparameter eta	
+	
+	vector<double> g_eta;
+	vector<double> h_eta;
+	g_eta.resize(num_topic, 0);
+	h_eta.resize(num_topic, 0);
+	
+	for(k=0; k < num_topic; k++){
+		for(j=0; j < num_lesion; j++){
+			int D_j = documents[j].size();
+			g_eta[k] += D_j * ( boost::math::digamma(sum_eta) - (tau[j][k]/sum_tau[j])* boost::math::digamma(eta[k]*tau[j][k]/sum_tau[j]) - (1/sum_tau[j])*(1-tau[j][k]/sum_tau[j]) );
+			for(d=0; d < documents[j].size(); d++){
+				g_eta[k] += (tau[j][k]/sum_tau[j])*((log(tau[j][k])+boost::math::digamma(rho[j][d][k])-boost::math::digamma(tau[j][k])) - (log(sum_tau[j])+boost::math::digamma(sum_rho[j][d])-boost::math::digamma(sum_tau[j])));	
+			}
+		}
+	}
+	
+	double z_eta = 0;
+	for(j=0; j < num_lesion; j++){
+		int D_j = documents[j].size();
+		z_eta += D_j * boost::math::trigamma(sum_eta);
+	}
+	
+	vector<double> q_eta;
+	q_eta.resize(num_topic, 0);
+	
 	for (k=0; k < num_topic; k++){
-        if(eta[k]<0){
-			cout<<"eta[k] : "<<eta[k]<<endl;
-			cout<<"g eta : "<<new_numerator_eta[k]<<endl;
-			cout<<"h eta : "<<new_denominator_eta[k]<<endl;
+		for(j=0; j < num_lesion; j++){
+			int D_j = documents[j].size();
+			q_eta[k] += -D_j * ((tau[j][k]*tau[j][k])/(sum_tau[j]*sum_tau[j]))*boost::math::trigamma(eta[k]*tau[j][k]/sum_tau[j]);
 		}
     }
 	
-	
-	// for(k=0; k < num_topic; k++){
-		// for(j=0; j < num_lesion; j++){
-			// int D_j = documents[j].size();
-			// g_eta[k] += D_j * ( boost::math::digamma(sum_eta) - (tau[j][k]/sum_tau[j])* boost::math::digamma(eta[k]*tau[j][k]/sum_tau[j]) - (1/sum_tau[j])*(1-tau[j][k]/sum_tau[j]) );
-			// for(d=0; d < documents[j].size(); d++){
-				// g_eta[k] += (tau[j][k]/sum_tau[j])*((log(tau[j][k])+boost::math::digamma(rho[j][d][k])-boost::math::digamma(tau[j][k])) - (log(sum_tau[j])+boost::math::digamma(sum_rho[j][d])-boost::math::digamma(sum_tau[j])));	
-			// }
-		// }
-	// }
-	
-	// for(k=0; k < num_topic; k++){
-		// for(j=0; j < num_lesion; j++){
-			// int D_j = documents[j].size();
-			// h_eta[k] += D_j * (boost::math::trigamma(sum_eta) - ((tau[j][k]*tau[j][k])/(sum_tau[j]*sum_tau[j]))*boost::math::trigamma(eta[k]*tau[j][k]/sum_tau[j]));
-		// }
-	// }
-		
-	// for(k=0; k < num_topic; k++){
-		// eta[k] += -g_eta[k]/h_eta[k];
-	// }
-	
-	// cout<<"boost::math::trigamma(sum_eta) : "<< boost::math::trigamma(sum_eta)<< endl;
-	// for(j=0; j < num_lesion; j++){
-		// for (k=0; k < num_topic; k++){
-			// cout<<"tau[j][k] : "<< tau[j][k]<< endl;
-		// }
-	// }
-	
-	
-	
-	// sum = 0;
-	// for(j=0; j < num_lesion; j++){
-		// for(d=0; d < documents[j].size(); d++){
-			// for(k=0; k < num_topic; k++){
-				// sum -= (tau[j][k]/sum_tau[j])*( boost::math::digamma(eta[k]*tau[j][k]/sum_tau[j]) - (log(tau[j][k]) - boost::math::digamma(tau[j][k]) + boost::math::digamma(rho[j][d][k]) ) );				
-			// }
-		// }
-	// }
-	
-	// for(k=0; k < num_topic; k++){
-		// for(j=0; j < num_lesion; j++){
-			// int D_j = documents[j].size();
-			// g_eta[k] += D_j * ( boost::math::digamma(eta[k]) - (1/sum_tau[j])*(num_topic-1) );
-			// for(d=0; d < documents[j].size(); d++){
-				// g_eta[k] += -1* ( log(sum_tau[j]) - boost::math::digamma(sum_tau[j]) + boost::math::digamma(sum_rho[j][d]) );
-			// }
-		// }
-		// g_eta[k] += sum;
-	// }
-	
-	// sum = 0;
-	// for(j=0; j < num_lesion; j++){
-		// for(d=0; d < documents[j].size(); d++){
-			// for(k=0; k < num_topic; k++){
-				// sum -= ( (tau[j][k]*tau[j][k])/ (sum_tau[j]*sum_tau[j]) ) * boost::math::trigamma(eta[k]*tau[j][k]/sum_tau[j]);
-			// }
-		// }
-	// }
-	
-	// for(k=0; k < num_topic; k++){
-		// for(j=0; j < num_lesion; j++){
-			// int D_j = documents[j].size();
-			// h_eta[k] += D_j * boost::math::trigamma(eta[k]);
-		// }
-		// h_eta[k] += sum;
-	// }
-		
-	// for(k=0; k < num_topic; k++){
-		// eta[k] += -g_eta[k]/h_eta[k];
-	// }
-	
-	// for (k=0; k < num_topic; k++){
-        // if(eta[k]<0){
-			// cout<<"g eta : "<<g_eta[k]<<endl;
-			// cout<<"h eta : "<<h_eta[k]<<endl;
-		// }
-    // }
+	double b_eta;
+	left = 0,right = 0;
+	for (k=0; k < num_topic; k++){
+		left += g_eta[k] / q_eta[k];
+		right += 1 / q_eta[k];
+	}
+	b_eta = left / (1/z_eta + right);
+    
+
+	for (k=0; k < num_topic; k++){
+		if(eta[k] + (-g_eta[k]+b_eta) / q_eta[k] > 0)
+			eta[k] += (-g_eta[k]+b_eta) / q_eta[k];
+	}
 	
 }
 
-void LDA::calc_vlb(){
+void LDA::calc_em_lb(){
     int j,d,v,i,k;
 	
     double first_comp = 0, second_comp = 0, third_comp = 0, 
@@ -857,7 +625,6 @@ void LDA::calc_vlb(){
         }
     }
 	
-	// cout << "digamma: 14" << endl;
 	double sum_alpha = accumulate(alpha.begin(), alpha.end(), 0.0);
     double log_sum_gamma_alpha = 0;
     for (k=0; k < num_topic; k++){
@@ -884,24 +651,7 @@ void LDA::calc_vlb(){
 		for(d=0; d < documents[j].size(); d++){
 			third_comp += boost::math::lgamma(Keta) - sum_lgamma_eta;
 			for (k=0; k < num_topic; k++){
-				if( tau[j][k] > 0 && sum_tau[j] > 0 ){
-					third_comp += -1 * (eta[k]/sum_tau[j]*(1-tau[j][k]/sum_tau[j])  + (1-eta[k]*tau[j][k]/sum_tau[j])*(log(tau[j][k]) - log(sum_tau[j]) + boost::math::digamma(sum_tau[j]) - boost::math::digamma(tau[j][k])) ) + (eta[k]*tau[j][k]/sum_tau[j] - 1)*(boost::math::digamma(rho[j][d][k])-boost::math::digamma(sum_rho[j][d]));
-				}
-				else{
-					if( sum_tau[j] > 0 ){
-						third_comp += -1 * (eta[k]/sum_tau[j]*(1-tau[j][k]/sum_tau[j])  + (1-eta[k]*tau[j][k]/sum_tau[j])*(-1 - log(sum_tau[j]) + boost::math::digamma(sum_tau[j]) - boost::math::digamma(tau[j][k])) ) + (eta[k]*tau[j][k]/sum_tau[j] - 1)*(boost::math::digamma(rho[j][d][k])-boost::math::digamma(sum_rho[j][d]));
-					}
-					else{
-						if(tau[j][k] > 0){
-							third_comp += -1 * (eta[k]/sum_tau[j]*(1-tau[j][k]/sum_tau[j])  + (1-eta[k]*tau[j][k]/sum_tau[j])*(log(tau[j][k]) - (-1) + boost::math::digamma(sum_tau[j]) - boost::math::digamma(tau[j][k])) ) + (eta[k]*tau[j][k]/sum_tau[j] - 1)*(boost::math::digamma(rho[j][d][k])-boost::math::digamma(sum_rho[j][d]));
-						}
-						else{
-							third_comp += -1 * (eta[k]/sum_tau[j]*(1-tau[j][k]/sum_tau[j])  + (1-eta[k]*tau[j][k]/sum_tau[j])*( boost::math::digamma(sum_tau[j]) - boost::math::digamma(tau[j][k])) ) + (eta[k]*tau[j][k]/sum_tau[j] - 1)*(boost::math::digamma(rho[j][d][k])-boost::math::digamma(sum_rho[j][d]));
-						}
-					}
-					
-				}
-				
+				third_comp += -1 * (eta[k]/sum_tau[j]*(1-tau[j][k]/sum_tau[j])  + (1-eta[k]*tau[j][k]/sum_tau[j])*(log(tau[j][k]) - boost::math::digamma(tau[j][k])  - log(sum_tau[j]) + boost::math::digamma(sum_tau[j])) ) + (eta[k]*tau[j][k]/sum_tau[j] - 1)*(boost::math::digamma(rho[j][d][k])-boost::math::digamma(sum_rho[j][d]));	
 			}
 		}
 	}
@@ -953,38 +703,170 @@ void LDA::calc_vlb(){
 		for(d=0; d < documents[j].size(); d++){
 			for(i=0; i < documents[j][d].size(); i++){
 				for (k=0; k < num_topic; k++){
-					if( phi[j][d][i][k] > 0){
-						ninth_comp += phi[j][d][i][k] * log(phi[j][d][i][k]);
-					}
-					else{
-						ninth_comp += phi[j][d][i][k] * -1;
-					}
-					
+					ninth_comp += phi[j][d][i][k] * log(phi[j][d][i][k]);
 				}
 			}
 		}
 	}
 
-
-	// cout << "first_comp: " << first_comp << endl;
-	// cout << "second_comp: " << second_comp << endl;
-	// cout << "third_comp: " << third_comp << endl;
-	// cout << "fourth_comp: " << fourth_comp << endl;
-	// cout << "fifth_comp: " << fifth_comp << endl;
-	// cout << "sixth_comp: " << sixth_comp << endl;
-	// cout << "seventh_comp: " << seventh_comp << endl;
-	// cout << "eighth_comp: " << eighth_comp << endl;
-	// cout << "ninth_comp: " << ninth_comp << endl;
-    temp_vlb = first_comp + second_comp + third_comp
+    em_lb_current = first_comp + second_comp + third_comp
              + fourth_comp + fifth_comp + sixth_comp
 			 + seventh_comp + eighth_comp + ninth_comp;
 }
 
+void LDA::calc_doc_vi_lb(){
+	int j,d,v,i,k;
+	
+    double third_comp = 0, fourth_comp = 0, fifth_comp = 0,
+		   eighth_comp = 0, ninth_comp = 0;
+
+	vector<double> sum_lam;
+	sum_lam.resize(num_topic, 0);
+	for(k=0; k < num_topic; k++){
+		sum_lam[k] = accumulate(lam[k].begin(), lam[k].end(), 0.0);
+	} 
+
+	vector<double> sum_tau;
+	sum_tau.resize(num_lesion, 0);
+	for(j=0; j < num_lesion; j++){
+		sum_tau[j] = accumulate(tau[j].begin(), tau[j].end(), 0.0);
+	}
+	
+	vector<vector<double> > sum_rho;
+    sum_rho.resize(num_lesion);
+    for(j=0; j < num_lesion; j++){
+		sum_rho[j].resize(documents[j].size(), 0);
+		for(d=0; d < documents[j].size(); d++){
+			sum_rho[j][d] = accumulate(rho[j][d].begin(), rho[j][d].end(), 0.0);
+		}
+    }
+	
+	double Keta = 0;
+    double sum_lgamma_eta = 0;
+    for (k=0; k < num_topic; k++){
+        Keta += eta[k];
+		for (j=0; j < num_lesion; j++){
+			sum_lgamma_eta += boost::math::lgamma(eta[k]*tau[j][k]/sum_tau[j]);
+		}
+    }
+	
+	for (j=0; j < num_lesion; j++){
+		for(d=0; d < documents[j].size(); d++){
+			third_comp += boost::math::lgamma(Keta) - sum_lgamma_eta;
+			for (k=0; k < num_topic; k++){
+				third_comp += -1 * (eta[k]/sum_tau[j]*(1-tau[j][k]/sum_tau[j])  + (1-eta[k]*tau[j][k]/sum_tau[j])*(log(tau[j][k]) - boost::math::digamma(tau[j][k])  - log(sum_tau[j]) + boost::math::digamma(sum_tau[j])) ) + (eta[k]*tau[j][k]/sum_tau[j] - 1)*(boost::math::digamma(rho[j][d][k])-boost::math::digamma(sum_rho[j][d]));	
+			}
+		}
+	}
+	
+	for (j=0; j < num_lesion; j++){
+		for(d=0; d < documents[j].size(); d++){
+			for(i=0; i < documents[j][d].size(); i++){
+				for (k=0; k < num_topic; k++){
+					fourth_comp += phi[j][d][i][k] * (boost::math::digamma(rho[j][d][k]) - boost::math::digamma(sum_rho[j][d]));
+				}
+			}
+		}
+	}
+	
+	for (j=0; j < num_lesion; j++){
+		for(d=0; d < documents[j].size(); d++){
+			for(i=0; i < documents[j][d].size(); i++){
+				for (k=0; k < num_topic; k++){
+					fifth_comp += phi[j][d][i][k] * (boost::math::digamma(lam[k][documents[j][d][i]]) - boost::math::digamma(sum_lam[k]));
+				}
+			}
+		}
+	}
+	
+	for (j=0; j < num_lesion; j++){
+		for(d=0; d < documents[j].size(); d++){
+			eighth_comp += boost::math::lgamma(sum_rho[j][d]);
+			for (k=0; k < num_topic; k++){
+				eighth_comp += -1 *  boost::math::lgamma(rho[j][d][k]) + (rho[j][d][k]-1) * (boost::math::digamma(rho[j][d][k]) - boost::math::digamma(sum_rho[j][d])) ;
+			}
+		}
+	}
+	
+	for (j=0; j < num_lesion; j++){
+		for(d=0; d < documents[j].size(); d++){
+			for(i=0; i < documents[j][d].size(); i++){
+				for (k=0; k < num_topic; k++){
+					ninth_comp += phi[j][d][i][k] * log(phi[j][d][i][k]);
+				}
+			}
+		}
+	}
+
+    doc_vi_lb = third_comp + fourth_comp + fifth_comp 
+			  + eighth_comp + ninth_comp;
+}
+
+void LDA::calc_vi_lb_tau(){
+	int j,d,v,i,k;
+	
+    double second_comp = 0, third_comp = 0, seventh_comp = 0;
+
+	vector<double> sum_lam;
+	sum_lam.resize(num_topic, 0);
+	for(k=0; k < num_topic; k++){
+		sum_lam[k] = accumulate(lam[k].begin(), lam[k].end(), 0.0);
+	}
+	
+	vector<vector<double> > sum_rho;
+    sum_rho.resize(num_lesion);
+    for(j=0; j < num_lesion; j++){
+		sum_rho[j].resize(documents[j].size(), 0);
+		for(d=0; d < documents[j].size(); d++){
+			sum_rho[j][d] = accumulate(rho[j][d].begin(), rho[j][d].end(), 0.0);
+		}
+    }
+	
+	double sum_alpha = accumulate(alpha.begin(), alpha.end(), 0.0);
+    double log_sum_gamma_alpha = 0;
+    for (k=0; k < num_topic; k++){
+        log_sum_gamma_alpha += boost::math::lgamma(alpha[k]);
+    }
+	
+	for (j=0; j < num_lesion; j++){
+		second_comp += boost::math::lgamma(sum_alpha) - log_sum_gamma_alpha;
+        for (k=0; k < num_topic; k++){
+            second_comp += (alpha[k]-1)* (boost::math::digamma(a_tau[j]*w_tau[j][k]) - boost::math::digamma(a_tau[j]) );
+        }
+    }
+	
+	double Keta = 0;
+    double sum_lgamma_eta = 0;
+    for (k=0; k < num_topic; k++){
+        Keta += eta[k];
+		for (j=0; j < num_lesion; j++){
+			sum_lgamma_eta += boost::math::lgamma(eta[k]*w_tau[j][k]);
+		}
+    }
+	
+	for (j=0; j < num_lesion; j++){
+		for(d=0; d < documents[j].size(); d++){
+			third_comp += boost::math::lgamma(Keta) - sum_lgamma_eta;
+			for (k=0; k < num_topic; k++){
+				third_comp += -1 * (eta[k]/a_tau[j]*(1-w_tau[j][k])  + (1-eta[k]*w_tau[j][k])*(log(a_tau[j]*w_tau[j][k]) - boost::math::digamma(a_tau[j]*w_tau[j][k])  - log(a_tau[j]) + boost::math::digamma(a_tau[j])) ) + (eta[k]*w_tau[j][k] - 1)*(boost::math::digamma(rho[j][d][k])-boost::math::digamma(sum_rho[j][d]));	
+			}
+		}
+	}
+	
+	for (j=0; j < num_lesion; j++){
+		seventh_comp += boost::math::lgamma(a_tau[j]);
+		for (k=0; k < num_topic; k++){
+			seventh_comp += -1 *  boost::math::lgamma(a_tau[j]*w_tau[j][k]) + (a_tau[j]*w_tau[j][k]-1) * (boost::math::digamma(a_tau[j]*w_tau[j][k]) - boost::math::digamma(a_tau[j])) ;
+		}
+	}
+	
+    vi_lb_tau = second_comp + third_comp + seventh_comp;
+}
+
 void LDA::load_data(){
 	int num_doc;
-	num_lesion = 1;
-	// const char *cancer_types[num_lesion] = {"breast", "prostate", "skin", "stomach"};
-	const char *cancer_types[num_lesion] = {"breast"};
+	num_lesion = 12;
+	const char *cancer_types[num_lesion] = {"breast", "endometrium", "large_intestine", "liver", "lung", "oesophagus", "prostate", "skin", "soft_tissue", "stomach", "upper_aerodigestive_tract", "urinary_tract"};
 	vector<vector<vector<int> > > raw_document;
 	raw_document.resize(num_lesion);
 	documents.resize(num_lesion);
@@ -1034,8 +916,7 @@ void LDA::load_data(){
 void LDA::write_data(){
     ofstream ofs;
     string output_file_name = "D:/mutational_signature/MS_cLDA/simulated_result/data" + to_string(data_type) + "_o" +
-        to_string(threshold) + "_all_" + to_string(experiment) + 
-        "/result_k";
+        to_string(threshold) + "_all_" + to_string(experiment) + "/result_k";
     if(num_topic < 10){
         output_file_name += "0" + to_string(num_topic) + ".txt";
     }
@@ -1043,13 +924,8 @@ void LDA::write_data(){
         output_file_name += to_string(num_topic) + ".txt";
     }
     ofs.open(output_file_name, ios::out);
-	if(num_topic ==2)
-		ofs << to_string(-120000+temp_vlb) << "\n";
-	else
-		ofs << to_string(temp_vlb) << "\n";
+	ofs << to_string(em_lb_current) << "\n";
     ofs << "0" << "\n";
-
-	// ofs << "mutation distribution for each mutational signature" << "\n";
 
     int j, d, k, v;
     vector<vector<double> > Enkv;
@@ -1063,13 +939,11 @@ void LDA::write_data(){
         }
         for (v = 0; v < num_vocab; v++) {
             Enkv[k][v] = lam[k][v] / sum_output[k];
-			// Enkv[k][v] = lam[k][v];
             ofs << to_string(Enkv[k][v]) << " ";
         }
         ofs << "\n";
     }
 	
-	// ofs << "mutational signature distribution for each lesion" << "\n";
     vector<vector<double> > Enjk;
     Enjk.resize(num_lesion);
 	vector<double> sum___output;
@@ -1082,17 +956,13 @@ void LDA::write_data(){
 	}
 	for (j = 0; j < num_lesion; j++){
         for (k = 0; k < num_topic; k++){
-            // Enjk[j][k] = tau[j][k] / sum___output[j];
-			Enjk[j][k] = tau[j][k];
+            Enjk[j][k] = tau[j][k] / sum___output[j];
             ofs << to_string(Enjk[j][k]) << " ";
         }
         ofs << "\n";
     }
 	
-	// ofs << "mutational signature distribution for each document of lesion" << "\n";
-
-	// const char *cancer_types[num_lesion] = {"breast", "prostate", "skin", "stomach"};
-	const char *cancer_types[num_lesion] = {"breast"};
+	const char *cancer_types[num_lesion] = {"breast", "endometrium", "large_intestine", "liver", "lung", "oesophagus", "prostate", "skin", "soft_tissue", "stomach", "upper_aerodigestive_tract", "urinary_tract"};
 	
     vector<vector<vector<double> > > Enjdk;
     Enjdk.resize(num_lesion);
@@ -1110,14 +980,11 @@ void LDA::write_data(){
 			}
 			for (k = 0; k < num_topic; k++){
 				Enjdk[j][d][k] = rho[j][d][k] / sum__output[j][d];
-				// Enjdk[j][d][k] = rho[j][d][k];
 				ofs << to_string(Enjdk[j][d][k]) << " ";
 			}
 			ofs << "\n";
 		}
     }
-	
-	// ofs << "alpha" << "\n";
 
 	for (k = 0; k < num_topic; k++){
 	    ofs << alpha[k] << " ";
@@ -1134,11 +1001,10 @@ void LDA::write_data(){
     ofs.close();
 }
 
-
-void LDA::show_vlb(){
-    calc_vlb();
-    cout << "VLB: " << temp_vlb << endl;
-    cout << "Improvement point: " << temp_vlb - old_vlb << endl;
+void LDA::show_em_lb(){
+    calc_em_lb();
+    cout << "VLB: " << em_lb_current << endl;
+    cout << "Improvement point: " << em_lb_current - em_lb_old << endl;
 }
 
 void LDA::Normalize(vector<double> &vec, int &length){
